@@ -534,65 +534,169 @@ RAW.trim().split('\n').forEach(line=>{
 
 /* ================= CORE (pure functions) ================= */
 //#CORE-START
+/* أخطاء الحساب: كل دالة ترمي CalcError بكود واضح، والواجهة تلتقطه وتعرض رسالة بلغة المستخدم */
+function CalcError(code){const e=new Error(code);e.name='CalcError';e.code=code;return e;}
+const isNum=v=>typeof v==='number'&&isFinite(v);
+/* قراءة الأرقام: إنجليزي/عربي/هندي، فاصلة عشرية عربية ٫، مسافات، وفواصل آلاف.
+   القاعدة: إن وُجد الفاصلان فآخرهما هو العشري. فاصلة وحدها: مجموعات من 3 أرقام (1,234) = آلاف، وإلا (1,5) = عشري.
+   نقطة وحدها = عشري، وتكون آلافًا فقط إن تكررت بمجموعات ثلاثية (1.234.567). أي شكل مبهم آخر = NaN (لا تخمين). */
 function parseNum(s){
-  if(s===null||s===undefined) return NaN;
-  s=String(s).trim(); if(!s) return NaN;
-  s=s.replace(/[٠-٩]/g,d=>'٠١٢٣٤٥٦٧٨٩'.indexOf(d)).replace(/[۰-۹]/g,d=>'۰۱۲۳۴۵۶۷۸۹'.indexOf(d))
-     .replace(/[٬,\s]/g,'').replace(/٫/g,'.');
-  if(!/^[+-]?(\d+\.?\d*|\.\d+)(e[+-]?\d+)?$/i.test(s)) return NaN;
-  const v=parseFloat(s); return isFinite(v)?v:NaN;
+  if(s===null||s===undefined||typeof s==='boolean') return NaN;
+  if(typeof s==='number') return isFinite(s)?s:NaN;
+  s=String(s).replace(/[‎‏‪-‮⁦-⁩]/g,'').replace(/[\s   ]/g,'')
+    .replace(/[٠-٩]/g,d=>'٠١٢٣٤٥٦٧٨٩'.indexOf(d)).replace(/[۰-۹]/g,d=>'۰۱۲۳۴۵۶۷۸۹'.indexOf(d))
+    .replace(/٫/g,'.').replace(/[٬،]/g,',').replace(/[−–]/g,'-');
+  if(!s) return NaN;
+  let sign=''; if(/^[+-]/.test(s)){sign=s[0]==='-'?'-':'';s=s.slice(1);}
+  let exp=''; const m=s.match(/e[+-]?\d+$/i); if(m){exp=m[0];s=s.slice(0,-m[0].length);}
+  if(!/^[\d.,]+$/.test(s)) return NaN;
+  const hasC=s.indexOf(',')>=0, hasD=s.indexOf('.')>=0;
+  const grp=th=>new RegExp('^\\d{1,3}(?:'+(th==='.'?'\\.':',')+'\\d{3})+$');
+  if(hasC&&hasD){
+    const dec=s.lastIndexOf(',')>s.lastIndexOf('.')?',':'.', th=dec===','?'.':',', parts=s.split(dec);
+    if(parts.length!==2||!/^\d*$/.test(parts[1])||!(grp(th).test(parts[0])||/^\d{1,3}$/.test(parts[0]))) return NaN;
+    s=parts[0].split(th).join('')+'.'+parts[1];
+  }else if(hasC){
+    const n=s.split(',').length-1;
+    if(grp(',').test(s)) s=s.split(',').join('');
+    else if(n===1&&/^\d*,\d+$/.test(s)) s=s.replace(',','.');
+    else return NaN;
+  }else if(hasD){
+    const n=s.split('.').length-1;
+    if(n>1){ if(grp('.').test(s)) s=s.split('.').join(''); else return NaN; }
+  }
+  if(!/^(\d+\.?\d*|\.\d+)$/.test(s)) return NaN;
+  const v=parseFloat(sign+s+exp);
+  return isFinite(v)&&Math.abs(v)<=1e15?v:NaN;
 }
-/* التحويل: المبلغ قبل الرسوم = المبلغ × السعر ، الرسوم: نسبة من المبلغ قبل الرسوم أو مبلغ ثابت بعملة الاستلام */
+/* التحويل: المبلغ قبل الرسوم = المبلغ × السعر. الرسوم: نسبة (0 إلى 100) من المبلغ قبل الرسوم، أو مبلغ ثابت بعملة الاستلام.
+   ترفض: مبلغ/سعر غير موجب أو غير رقمي، رسوم سالبة، نسبة فوق 100، رسوم تتجاوز المبلغ، أو تجاوز حدود الأرقام. */
 function calcConvert(o){
+  if(!o||!isNum(o.amt)||o.amt<=0) throw CalcError('amt');
+  if(!isNum(o.rate)||o.rate<=0) throw CalcError('rate');
+  const ft=o.feeType||'none';
+  if(ft!=='none'&&ft!=='pct'&&ft!=='fix') throw CalcError('feeType');
+  const fv=ft==='none'?0:o.feeVal;
+  if(!isNum(fv)||fv<0) throw CalcError('fee');
+  if(ft==='pct'&&fv>100) throw CalcError('feePct');
   const gross=o.amt*o.rate;
-  let fee=0;
-  if(o.feeType==='pct') fee=gross*o.feeVal/100;
-  else if(o.feeType==='fix') fee=o.feeVal;
+  if(!isNum(gross)) throw CalcError('overflow');
+  let fee=ft==='pct'?gross*fv/100:ft==='fix'?fv:0;
+  if(!isNum(fee)) throw CalcError('overflow');
+  if(fee>gross*(1+1e-12)) throw CalcError('feeBig');
+  fee=Math.min(fee,gross);
   return {gross,fee,net:gross-fee};
 }
-/* الربح والخسارة (المعادلات المطلوبة حرفيًا) */
+/* الربح والخسارة. سعر التحويل الأول r1 وسعر إعادة التحويل r2 مستقلان (ليسا مقلوبين بالضرورة).
+   f1 بعملة المبلغ المحوَّل (B) و f2 بعملة رأس المال (A). */
 function calcPnl(o){
-  const gross1=o.cap*o.r1;            // المبلغ قبل الرسوم = المبلغ الأصلي × سعر التحويل
-  const after1=gross1-o.f1;           // المبلغ بعد الرسوم = قبل الرسوم − رسوم التحويل
+  if(!o||!isNum(o.cap)||o.cap<=0) throw CalcError('cap');
+  if(!isNum(o.r1)||o.r1<=0||!isNum(o.r2)||o.r2<=0) throw CalcError('rate');
+  if(!isNum(o.f1)||o.f1<0||!isNum(o.f2)||o.f2<0) throw CalcError('fee');
+  const gross1=o.cap*o.r1;            // المبلغ قبل الرسوم = رأس المال × سعر التحويل
+  if(!isNum(gross1)) throw CalcError('overflow');
+  const after1=gross1-o.f1;           // بعد رسوم التحويل الأول
+  if(!(after1>0)) throw CalcError('after1');
   const gross2=after1*o.r2;           // بعد إعادة التحويل قبل الرسوم
-  const recovered=gross2-o.f2;        // المسترد = بعد الرسوم × سعر إعادة التحويل − رسوم إعادة التحويل
-  const pnl=recovered-o.cap;          // صافي الربح/الخسارة
-  const pct=pnl/o.cap*100;            // النسبة
-  const be=after1>0?(o.cap+o.f2)/after1:NaN; // سعر إعادة التحويل اللازم للتعادل
+  if(!isNum(gross2)) throw CalcError('overflow');
+  if(o.f2>gross2*(1+1e-12)) throw CalcError('fee2Big');
+  const recovered=Math.max(0,gross2-o.f2);   // المسترد = بعد الرسوم × سعر الإعادة − رسوم الإعادة
+  const pnl=recovered-o.cap;                 // صافي الربح أو الخسارة
+  const pct=pnl/o.cap*100;                   // النسبة
+  const be=(o.cap+o.f2)/after1;              // سعر إعادة التحويل اللازم للتعادل (after1 > 0 مضمون)
   return {gross1,after1,gross2,recovered,pnl,pct,be};
 }
-/* عرض مقارنة: رسوم الإرسال بعملة المرسل، رسوم الاستقبال والإضافية بعملة المستلم */
-function calcOffer(o){ return (o.amt-o.sf)*o.rate-o.rf-o.ex; }
+/* عرض مقارنة: رسوم الإرسال sf بعملة المرسل، ورسوم الاستقبال rf والإضافية ex بعملة المستلم. */
+function calcOffer(o){
+  if(!o||!isNum(o.amt)||o.amt<=0) throw CalcError('amt');
+  if(!isNum(o.rate)||o.rate<=0) throw CalcError('rate');
+  if(!isNum(o.sf)||o.sf<0||!isNum(o.rf)||o.rf<0||!isNum(o.ex)||o.ex<0) throw CalcError('fee');
+  if(o.sf>=o.amt) throw CalcError('sendFee');
+  const net=(o.amt-o.sf)*o.rate-o.rf-o.ex;
+  if(!isNum(net)) throw CalcError('overflow');
+  if(net<=0) throw CalcError('feeBig');
+  return net;
+}
 //#CORE-END
 
 /* ================= الحالة والتخزين ================= */
 const $=id=>document.getElementById(id);
+function numOr0(id){const v=$(id).value;return String(v).trim()===''?0:parseNum(v);}   // الحقل الفارغ = صفر
+const ERRMAP={amt:'eAmt',rate:'eRateH',fee:'eFeeH',feeType:'eFeeH',feePct:'eFeePct',feeBig:'eFeeBig',overflow:'eOverflow',cap:'eCap',after1:'eAfter',fee2Big:'eFee2Big',sendFee:'eSendFee',same:'eSame'};
+function calcErrMsg(e){ if(e&&e.name==='CalcError'&&ERRMAP[e.code]) return t(ERRMAP[e.code]); try{console.error(e);}catch(x){} return t('eUnexpected'); }
+let errShown=false;
+function globalErr(e){try{console.error(e);}catch(x){} if(errShown) return; errShown=true; try{showBanner(t('eUnexpected'),false);}catch(x){}}
+window.addEventListener('error',ev=>globalErr(ev.error||ev.message));
+window.addEventListener('unhandledrejection',ev=>globalErr(ev.reason));
 const QS=new URLSearchParams(location.search);
-const PLAT=(QS.get('p')||QS.get('platform')||'').replace(/[^\w\u0600-\u06FF \-]/g,'').trim().slice(0,20);
+const PLAT=(QS.get('p')||QS.get('platform')||'').replace(/[^\w؀-ۿ \-]/g,'').trim().slice(0,20);
 const EMBED=QS.get('embed')==='1';
 const LS='mdx_currency_v1'+(PLAT?'_'+PLAT.toLowerCase().replace(/\s+/g,''):'');
+const SCHEMA=2;
 let S={srcMap:{},mb:'USD',prev:null,lang:'ar',from:'LYD',to:'USD',pa:'LYD',pb:'USD',cf:'LYD',ct:'USD',favs:['USD','EUR','EGP','SAR'],history:[],offers:null,rates:null,meta:null,
        manual:false, fetchState:'idle', fetchErr:''};
 const OFFER_KEYS=['offer1','offer2','offer3','offer4','offer5'];
 function newOffer(key){return {key:key||'offerCustom',name:'',rate:'',sf:'0',rf:'0',ex:'0',time:''};}
+/* تنظيف أي بيانات مخزنة (قديمة أو تالفة أو معدّلة يدويًا) قبل استخدامها */
+function cleanRates(obj,min){
+  if(!obj||typeof obj!=='object'||Array.isArray(obj)) return null;
+  const out={};let n=0;
+  Object.keys(obj).forEach(k=>{const v=obj[k];if(/^[A-Z]{3}$/.test(k)&&typeof v==='number'&&isFinite(v)&&v>0){out[k]=v;n++;}});
+  if(n<min||!out.USD||Math.abs(out.USD-1)>1e-6) return null;   // الأساس الدولار ويجب أن يساوي 1
+  return out;
+}
+const fin=v=>typeof v==='number'&&isFinite(v)?v:null;
+const txt=(v,n)=>(typeof v==='string'||typeof v==='number')?String(v).slice(0,n):'';
+function cleanHistory(arr){
+  if(!Array.isArray(arr)) return [];
+  const out=[];
+  arr.slice(0,3000).forEach(e=>{
+    if(!e||typeof e!=='object'||!CUR[e.from]||!CUR[e.to]) return;
+    const ts=fin(e.ts),amount=fin(e.amount),rate=fin(e.rate),netVal=fin(e.netVal);
+    if(ts===null||amount===null||rate===null||netVal===null) return;
+    const o={id:txt(e.id,24).replace(/[^\w-]/g,'')||ts.toString(36),type:e.type==='pnl'?'pnl':'conv',ts,from:e.from,to:e.to,amount,rate,feeText:txt(e.feeText,120),netVal,netCur:CUR[e.netCur]?e.netCur:e.to,pnl:null};
+    if(e.type==='pnl'){
+      const p=fin(e.pnl),pp=fin(e.pnlPct); if(p===null||pp===null||!CUR[e.pnlCur]) return;
+      o.pnl=p;o.pnlCur=e.pnlCur;o.pnlPct=pp; const r2=fin(e.rate2); if(r2!==null)o.rate2=r2;
+    }
+    out.push(o);
+  });
+  return out;
+}
+function cleanOffers(arr){
+  if(!Array.isArray(arr)||!arr.length) return OFFER_KEYS.map(newOffer);
+  return arr.slice(0,20).filter(o=>o&&typeof o==='object').map(o=>({key:OFFER_KEYS.indexOf(o.key)>=0?o.key:'offerCustom',name:txt(o.name,60),rate:txt(o.rate,30),sf:txt(o.sf,30),rf:txt(o.rf,30),ex:txt(o.ex,30),time:txt(o.time,60)}));
+}
 function load(){
-  try{const d=JSON.parse(localStorage.getItem(LS)||'{}');
-    ['lang','from','to','pa','pb','cf','ct','favs','history','offers','rates','meta','mb','prev','srcMap'].forEach(k=>{if(d[k]!==undefined&&d[k]!==null) S[k]=d[k];});
-  }catch(e){}
-  if(!CUR[S.mb]) S.mb='USD';
-  ['from','to','pa','pb','cf','ct'].forEach(k=>{if(!CUR[S[k]]) S[k]=({from:'LYD',to:'USD',pa:'LYD',pb:'USD',cf:'LYD',ct:'USD'})[k];});
-  S.favs=(S.favs||[]).filter(c=>CUR[c]);
-  if(!S.offers||!S.offers.length) S.offers=OFFER_KEYS.map(newOffer);
+  let raw=null,d={};
+  try{raw=localStorage.getItem(LS);}catch(e){}
+  if(raw){
+    try{d=JSON.parse(raw);if(!d||typeof d!=='object'||Array.isArray(d))throw 0;}
+    catch(e){d={};try{localStorage.setItem(LS+'_corrupt',raw);}catch(x){}}   // نحتفظ بنسخة من التالف بدل مسحه بصمت
+  }
+  S.lang=d.lang==='en'?'en':'ar';
+  const def={from:'LYD',to:'USD',pa:'LYD',pb:'USD',cf:'LYD',ct:'USD',mb:'USD'};
+  Object.keys(def).forEach(k=>{S[k]=(typeof d[k]==='string'&&CUR[d[k]])?d[k]:def[k];});
+  S.favs=Array.isArray(d.favs)?d.favs.filter((c,i,a)=>typeof c==='string'&&CUR[c]&&a.indexOf(c)===i):S.favs.filter(c=>CUR[c]);
+  S.history=cleanHistory(d.history);
+  S.offers=cleanOffers(d.offers);
+  S.rates=cleanRates(d.rates,20);
+  const m=d.meta;
+  S.meta=(S.rates&&m&&typeof m==='object')?{source:txt(m.source,80)||'—',updated:fin(m.updated)||0,fetched:fin(m.fetched)||0,live:false}:null;
+  if(!S.rates) S.meta=null;
+  const pv=d.prev&&typeof d.prev==='object'?cleanRates(d.prev.rates,1):null;
+  S.prev=pv?{rates:pv,time:fin(d.prev.time)||0}:null;
+  S.srcMap={}; if(d.srcMap&&typeof d.srcMap==='object') Object.keys(d.srcMap).forEach(k=>{if(CUR[k]&&d.srcMap[k]==='fw')S.srcMap[k]='fw';});
 }
 function save(){
-  try{localStorage.setItem(LS,JSON.stringify({lang:S.lang,from:S.from,to:S.to,pa:S.pa,pb:S.pb,cf:S.cf,ct:S.ct,favs:S.favs,history:S.history,offers:S.offers,rates:S.rates,meta:S.meta,mb:S.mb,prev:S.prev,srcMap:S.srcMap}));}
+  try{localStorage.setItem(LS,JSON.stringify({v:SCHEMA,lang:S.lang,from:S.from,to:S.to,pa:S.pa,pb:S.pb,cf:S.cf,ct:S.ct,favs:S.favs,history:S.history,offers:S.offers,rates:S.rates,meta:S.meta,mb:S.mb,prev:S.prev,srcMap:S.srcMap}));}
   catch(e){toast(t('storeErr'));}
 }
 
 /* ================= الترجمة ================= */
 const T={
 ar:{
- tagline:'حاسبة العملات والأرباح والخسائر',tabBoard:'لوحة السوق',autoNote:'تحديث تلقائي: عند الفتح وكل ساعة وعند العودة للصفحة أو عودة الإنترنت. مصادر البيانات مجانية وتتحدث يوميًا.',fbUsed:'تعذّر المصدر الأساسي، تم استخدام المصدر الاحتياطي (fawazahmed0).',boardTitle:'لوحة الأسعار على غرار الأسهم',boardIntro:'كل عملة مفضلة بخلفية علم دولتها: أخضر عند الارتفاع، أحمر عند الانخفاض، فضي عند عدم التغيّر. السعر هو سعر الزوج (العملة الأساسية / العملة المقابلة).',boardBase:'العملة الأساسية',boardNone:'أضف عملات مفضلة لعرضها هنا.',boardNoChg:'لا يتوفر تغيّر لهذا الزوج بعد',srcEcb:'التغيّر اليومي: البنك المركزي الأوروبي',srcSnap:'التغيّر منذ السعر المخزن في',openConv:'فتح في المحول',refLink:'↗ مرجع Investing.com',boardNote:'التغيّر محسوب من بيانات فعلية فقط: بيانات البنك المركزي الأوروبي للعملات المدعومة، وإلا مقارنة بآخر سعر مخزن على جهازك. لا تُسحب الأسعار تلقائيًا من Investing.com (لا يوفر واجهة مفتوحة)؛ استخدم زر «مرجع Investing.com» لمطابقة السعر ثم أدخله يدويًا في حقل سعر الصرف.',flat:'لا تغيّر',refresh:'⟳ تحديث الأسعار',
+ tagline:'حاسبة العملات والأرباح والخسائر',tabBoard:'لوحة السوق',eFeePct:'نسبة الرسوم يجب أن تكون بين 0 و100%.',eOverflow:'الأرقام كبيرة جدًا للحساب. قلّلها.',eFee2Big:'رسوم إعادة التحويل أكبر من المبلغ المُعاد تحويله.',eSendFee:'رسوم الإرسال تساوي المبلغ أو تتجاوزه.',eSpread:'هامش الشراء/البيع يجب أن يكون بين 0 و50%.',eUnexpected:'حدث خطأ غير متوقع. حدّث الصفحة وأعد المحاولة. بياناتك المحفوظة لم تتأثر.',offersReset:'تم تصفير أسعار ورسوم العروض لأن زوج العملات تغيّر.',autoNote:'تحديث تلقائي: عند الفتح وكل ساعة وعند العودة للصفحة أو عودة الإنترنت. مصادر البيانات مجانية وتتحدث يوميًا.',fbUsed:'تعذّر المصدر الأساسي، تم استخدام المصدر الاحتياطي (fawazahmed0).',boardTitle:'لوحة الأسعار على غرار الأسهم',boardIntro:'كل عملة مفضلة بخلفية علم دولتها: أخضر عند الارتفاع، أحمر عند الانخفاض، فضي عند عدم التغيّر. السعر هو سعر الزوج (العملة الأساسية / العملة المقابلة).',boardBase:'العملة الأساسية',boardNone:'أضف عملات مفضلة لعرضها هنا.',boardNoChg:'لا يتوفر تغيّر لهذا الزوج بعد',srcEcb:'التغيّر اليومي: البنك المركزي الأوروبي',srcSnap:'التغيّر منذ السعر المخزن في',openConv:'فتح في المحول',refLink:'↗ مرجع Investing.com',boardNote:'التغيّر محسوب من بيانات فعلية فقط: بيانات البنك المركزي الأوروبي للعملات المدعومة، وإلا مقارنة بآخر سعر مخزن على جهازك. لا تُسحب الأسعار تلقائيًا من Investing.com (لا يوفر واجهة مفتوحة)؛ استخدم زر «مرجع Investing.com» لمطابقة السعر ثم أدخله يدويًا في حقل سعر الصرف.',flat:'لا تغيّر',refresh:'⟳ تحديث الأسعار',
  tabHome:'المحول',tabPnl:'الربح والخسارة',tabCmp:'مقارنة التحويل',tabHist:'السجل',
  convTitle:'محول العملات',amount:'المبلغ الأصلي',fromCur:'من عملة',toCur:'إلى عملة',
  rateLbl:'سعر الصرف المستخدم (كم وحدة من عملة الاستلام مقابل 1 من الأصلية)',useMarket:'السعر المرجعي',
@@ -624,8 +728,8 @@ ar:{
  tConv:'تحويل',tPnl:'ربح/خسارة',noHist:'لا توجد عمليات مطابقة.',count:'عدد العمليات',confirmDel:'حذف هذه العملية؟',confirmClear:'حذف كل السجل نهائيًا؟',saved:'تم الحفظ في السجل',
  repTitle:'تقرير العمليات — MD Currency Exchange',repDate:'تاريخ التقرير',
  pickSearch:'ابحث بالاسم أو الرمز أو الدولة…',noRes:'لا نتائج.',
- stLive:'أسعار مرجعية مباشرة',stCached:'أسعار مخزنة (قد تكون قديمة)',stNone:'لا توجد أسعار — أدخل يدويًا',stLoad:'جارٍ التحديث…',
- bLive:'مباشر',bCached:'مخزن — قد يكون قديمًا',bManual:'يدوي — غير محدَّث تلقائيًا',bNone:'لا يوجد سعر — أدخل السعر يدويًا',
+ stLive:'أسعار مرجعية يومية محدّثة',stCached:'أسعار مخزنة (قد تكون قديمة)',stNone:'لا توجد أسعار — أدخل يدويًا',stLoad:'جارٍ التحديث…',
+ bLive:'محدّث (يومي)',bCached:'مخزن — قد يكون قديمًا',bManual:'يدوي — غير محدَّث تلقائيًا',bNone:'لا يوجد سعر — أدخل السعر يدويًا',
  updated:'آخر تحديث',source:'المصدر',fetched:'وقت الجلب',
  errFetch:'تعذّر تحديث الأسعار المباشرة. يمكنك الاستمرار بالأسعار اليدوية أو المخزنة.',errFetchCached:'(يُستخدم آخر سعر مخزن، وقد يكون قديمًا)',
  okFetch:'تم تحديث الأسعار',eAmt:'أدخل مبلغًا صحيحًا أكبر من صفر.',eRateH:'أدخل سعر صرف صحيحًا أكبر من صفر.',eFeeH:'قيمة الرسوم غير صحيحة.',eFeeBig:'الرسوم تساوي أو تتجاوز المبلغ المحوَّل.',
@@ -633,7 +737,7 @@ ar:{
  toFrom:'من',toTo:'إلى',remove:'حذف',own:'الأصلية',mid:'المحوَّلة',per:'لكل 1',rateBy:'سعر الصرف',oneOf:'1'
 },
 en:{
- tagline:'Currency, Profit & Loss Calculator',tabBoard:'Market board',autoNote:'Auto-update: on open, hourly, and when you return to the page or reconnect. Free sources update daily.',fbUsed:'Primary source failed; the backup source (fawazahmed0) was used.',boardTitle:'Stock-style rates board',boardIntro:'Each favorite currency on its country flag: green when up, red when down, silver when unchanged. Price is the pair price (base / quote).',boardBase:'Base currency',boardNone:'Add favorite currencies to show them here.',boardNoChg:'No change data for this pair yet',srcEcb:'Daily change: European Central Bank',srcSnap:'Change since rate stored on',openConv:'Open in converter',refLink:'↗ Investing.com reference',boardNote:'Change uses real data only: ECB data for supported currencies, otherwise a comparison with the last rate stored on your device. Prices are not auto-pulled from Investing.com (no open API); use the “Investing.com reference” link to check a price, then enter it manually in the rate field.',flat:'Unchanged',refresh:'⟳ Refresh rates',
+ tagline:'Currency, Profit & Loss Calculator',tabBoard:'Market board',eFeePct:'Fee percentage must be between 0 and 100%.',eOverflow:'Numbers are too large to calculate. Reduce them.',eFee2Big:'Re-conversion fee exceeds the amount being re-converted.',eSendFee:'Sending fee equals or exceeds the amount.',eSpread:'Buy/sell spread must be between 0 and 50%.',eUnexpected:'Unexpected error. Refresh the page and retry. Your saved data is unaffected.',offersReset:'Offer rates and fees were reset because the currency pair changed.',autoNote:'Auto-update: on open, hourly, and when you return to the page or reconnect. Free sources update daily.',fbUsed:'Primary source failed; the backup source (fawazahmed0) was used.',boardTitle:'Stock-style rates board',boardIntro:'Each favorite currency on its country flag: green when up, red when down, silver when unchanged. Price is the pair price (base / quote).',boardBase:'Base currency',boardNone:'Add favorite currencies to show them here.',boardNoChg:'No change data for this pair yet',srcEcb:'Daily change: European Central Bank',srcSnap:'Change since rate stored on',openConv:'Open in converter',refLink:'↗ Investing.com reference',boardNote:'Change uses real data only: ECB data for supported currencies, otherwise a comparison with the last rate stored on your device. Prices are not auto-pulled from Investing.com (no open API); use the “Investing.com reference” link to check a price, then enter it manually in the rate field.',flat:'Unchanged',refresh:'⟳ Refresh rates',
  tabHome:'Converter',tabPnl:'Profit & Loss',tabCmp:'Compare transfers',tabHist:'History',
  convTitle:'Currency converter',amount:'Original amount',fromCur:'From currency',toCur:'To currency',
  rateLbl:'Exchange rate used (units of target currency per 1 of source)',useMarket:'Market rate',
@@ -665,8 +769,8 @@ en:{
  tConv:'Conversion',tPnl:'P&L',noHist:'No matching operations.',count:'Operations',confirmDel:'Delete this operation?',confirmClear:'Permanently delete the whole history?',saved:'Saved to history',
  repTitle:'Operations report — MD Currency Exchange',repDate:'Report date',
  pickSearch:'Search by name, code or country…',noRes:'No results.',
- stLive:'Live reference rates',stCached:'Stored rates (may be outdated)',stNone:'No rates — enter manually',stLoad:'Updating…',
- bLive:'Live',bCached:'Stored — may be outdated',bManual:'Manual — not auto-updated',bNone:'No rate — enter manually',
+ stLive:'Daily reference rates (updated)',stCached:'Stored rates (may be outdated)',stNone:'No rates — enter manually',stLoad:'Updating…',
+ bLive:'Updated (daily)',bCached:'Stored — may be outdated',bManual:'Manual — not auto-updated',bNone:'No rate — enter manually',
  updated:'Last update',source:'Source',fetched:'Fetched',
  errFetch:'Could not update live rates. You can continue with manual or stored rates.',errFetchCached:'(last stored rates are used and may be outdated)',
  okFetch:'Rates updated',eAmt:'Enter a valid amount greater than zero.',eRateH:'Enter a valid exchange rate greater than zero.',eFeeH:'Invalid fee value.',eFeeBig:'Fee equals or exceeds the converted amount.',
@@ -714,40 +818,45 @@ async function getJSON(url,ms){
 /* المصدر 1: ExchangeRate-API (تحديث يومي، يشترط ذكر المصدر) */
 async function srcER(){
   const j=await getJSON('https://open.er-api.com/v6/latest/USD');
-  if(j.result!=='success'||!j.rates) throw new Error('bad');
-  return {rates:j.rates,updated:(j.time_last_update_unix||0)*1000};
+  if(!j||j.result!=='success') throw new Error('bad');
+  const rates=cleanRates(j.rates,20); if(!rates) throw new Error('bad rates');
+  return {rates,updated:(fin(j.time_last_update_unix)||0)*1000};
 }
 /* المصدر 2 (احتياطي): fawazahmed0/currency-api على jsDelivr ثم Cloudflare */
 async function srcFawaz(){
   let j;
   try{j=await getJSON('https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/v1/currencies/usd.min.json');}
   catch(e){j=await getJSON('https://latest.currency-api.pages.dev/v1/currencies/usd.min.json');}
-  if(!j||!j.usd) throw new Error('bad');
-  const rates={}; Object.keys(j.usd).forEach(k=>{const v=j.usd[k];if(isFinite(v)&&v>0)rates[k.toUpperCase()]=v;});
+  if(!j||!j.usd||typeof j.usd!=='object') throw new Error('bad');
+  const up={}; Object.keys(j.usd).forEach(k=>{up[k.toUpperCase()]=j.usd[k];});
+  const rates=cleanRates(up,20); if(!rates) throw new Error('bad rates');
   return {rates,updated:Date.parse(j.date)||Date.now()};
 }
 async function fetchRates(auto){
   if(fetching) return; fetching=true; S.fetchState='loading'; renderStatus();
-  let er=null,fw=null;
-  try{er=await srcER();}catch(e){}
-  const missing=er?LIST.filter(c=>!er.rates[c.code]).length:LIST.length;
-  if(!er||missing>0){try{fw=await srcFawaz();}catch(e){}}
-  if(er||fw){
-    if(S.rates&&S.meta&&(!S.prev||Date.now()-S.meta.fetched>6*36e5)) S.prev={rates:S.rates,time:S.meta.fetched};
-    const rates={},srcMap={};
-    if(er) Object.assign(rates,er.rates);
-    if(fw) Object.keys(fw.rates).forEach(k=>{if(!rates[k]&&CUR[k]){rates[k]=fw.rates[k];srcMap[k]='fw';}});
-    if(!er) rates.USD=1;
-    S.rates=rates; S.srcMap=srcMap;
-    S.meta={source:er?'ExchangeRate-API (open.er-api.com)':'fawazahmed0 currency-api',updated:er?er.updated:fw.updated,fetched:Date.now(),live:true};
-    S.fetchState='ok'; save();
-    if(!er) showBanner(t('fbUsed'),true); else hideBanner();
-    if(!auto) toast(t('okFetch'));
-  }else{
-    S.fetchState='err'; if(S.meta) S.meta.live=false;
-    showBanner(t('errFetch')+(S.rates?' '+t('errFetchCached'):''),false);
-  }
-  fetching=false;
+  try{
+    let er=null,fw=null;
+    try{er=await srcER();}catch(e){}
+    const missing=er?LIST.filter(c=>!er.rates[c.code]).length:LIST.length;
+    if(!er||missing>0){try{fw=await srcFawaz();}catch(e){}}
+    if(er||fw){
+      if(S.rates&&S.meta&&S.meta.fetched&&(!S.prev||Date.now()-S.meta.fetched>6*36e5)) S.prev={rates:S.rates,time:S.meta.fetched};
+      const rates={},srcMap={};
+      if(er) Object.assign(rates,er.rates);
+      if(fw) Object.keys(fw.rates).forEach(k=>{if(!rates[k]&&CUR[k]){rates[k]=fw.rates[k];srcMap[k]='fw';}});
+      rates.USD=1;
+      S.rates=rates; S.srcMap=srcMap;
+      S.meta={source:er?'ExchangeRate-API (open.er-api.com)':'fawazahmed0 currency-api',updated:er?er.updated:fw.updated,fetched:Date.now(),live:true};
+      S.fetchState='ok'; save();
+      if(!er) showBanner(t('fbUsed'),true); else hideBanner();
+      if(!auto) toast(t('okFetch'));
+    }else{
+      S.fetchState='err'; if(S.meta) S.meta.live=false;
+      showBanner(t('errFetch')+(S.rates?' '+t('errFetchCached'):''),false);
+    }
+  }catch(e){
+    S.fetchState='err'; globalErr(e);
+  }finally{ fetching=false; }
   renderStatus(); syncRate(); pnlAutoRates(false); renderCmp(); renderFavs(); loadChartSoon(); loadBoard();
 }
 function renderStatus(){
@@ -819,8 +928,9 @@ function syncRate(){
 }
 function calcHome(){
   const fc=CUR[S.from],tc=CUR[S.to];
-  const amt=parseNum($('amt').value), rate=parseNum($('rate').value), feeVal=parseNum($('feeVal').value), spread=parseNum($('spread').value)||0;
-  const ft=$('feeType').value;
+  const amt=parseNum($('amt').value), rate=parseNum($('rate').value);
+  const ft=$('feeType').value, feeVal=ft==='none'?0:numOr0('feeVal');
+  const spRaw=$('spread').value, spread=String(spRaw).trim()===''?0:parseNum(spRaw);
   $('feeUnit').textContent=ft==='pct'?t('feeUnitPct'):ft==='fix'?'('+S.to+')':'';
   $('feeVal').disabled=(ft==='none');
   $('refLink').href='https://www.investing.com/currencies/'+S.from.toLowerCase()+'-'+S.to.toLowerCase();
@@ -828,33 +938,33 @@ function calcHome(){
   let tm='—';
   if(S.manual) tm=t('bManual'); else if(S.meta&&S.rates){tm=S.meta.source+' · '+dtFmt(S.meta.updated||S.meta.fetched);const sm=S.srcMap||{};if(S.meta.source.indexOf('fawaz')<0&&(sm[S.from]==='fw'||sm[S.to]==='fw'))tm+=' + fawazahmed0';}
   $('outTime').textContent=tm;
-  let warn='';
-  const ok=amt>0&&rate>0&&(ft==='none'||(feeVal>=0));
-  if(!(amt>0)) warn=t('eAmt'); else if(!(rate>0)) warn=t('eRateH'); else if(ft!=='none'&&!(feeVal>=0)) warn=t('eFeeH');
-  $('homeWarn').textContent=warn; $('saveConv').disabled=!ok;
-  if(!ok||S.from===S.to&&false){
-    ['outNet','outGross','outFee','outRate','outInv','outBuy','outSell'].forEach(i=>$(i).textContent='—'); $('shareBar').innerHTML=''; $('shareTxt').textContent=''; return;
+  let r;
+  try{ r=calcConvert({amt,rate,feeType:ft,feeVal}); }
+  catch(e){
+    ['outNet','outGross','outFee','outRate','outInv','outBuy','outSell'].forEach(i=>{$(i).textContent='—';});
+    $('outNet').style.color=''; $('shareBar').innerHTML=''; $('shareTxt').textContent='';
+    $('homeWarn').textContent=calcErrMsg(e); $('saveConv').disabled=true; return;   // لا نتائج قديمة بعد الخطأ
   }
-  const r=calcConvert({amt,rate,feeType:ft,feeVal:ft==='none'?0:feeVal});
+  $('saveConv').disabled=false; $('homeWarn').textContent='';
   $('outNet').textContent=fmt(r.net,tc.dec)+' '+tc.code;
   $('outNet').style.color=r.net<=0?'var(--red)':'';
   $('outGross').textContent=fmtM(r.gross,tc.code);
   $('outFee').textContent=fmtM(r.fee,tc.code);
   $('outRate').textContent='1 '+fc.code+' = '+fmtRate(rate)+' '+tc.code;
   $('outInv').textContent='1 '+tc.code+' = '+fmtRate(1/rate)+' '+fc.code;
-  const s=Math.max(0,spread)/200;
-  $('outBuy').textContent='1 '+fc.code+' = '+fmtRate(rate*(1-s))+' '+tc.code;
-  $('outSell').textContent='1 '+fc.code+' = '+fmtRate(rate*(1+s))+' '+tc.code;
+  if(spread>=0&&spread<=50){
+    const s=spread/200;
+    $('outBuy').textContent='1 '+fc.code+' = '+fmtRate(rate*(1-s))+' '+tc.code;
+    $('outSell').textContent='1 '+fc.code+' = '+fmtRate(rate*(1+s))+' '+tc.code;
+  }else{ $('outBuy').textContent='—'; $('outSell').textContent='—'; $('homeWarn').textContent=t('eSpread'); }
   const feeShare=r.gross>0?Math.min(100,Math.max(0,r.fee/r.gross*100)):0;
   $('shareBar').innerHTML=`<i style="width:${100-feeShare}%;background:linear-gradient(90deg,${tc.color},${mix(tc.color,'#ffffff',.35)})"></i><i style="width:${feeShare}%;background:var(--red)"></i>`;
   $('shareTxt').textContent=fmt(100-feeShare,1)+'% '+t('netL')+' · '+fmt(feeShare,1)+'% '+t('feeL');
   if(r.net<=0) $('homeWarn').textContent=t('eFeeBig');
 }
 function readHome(){
-  const amt=parseNum($('amt').value),rate=parseNum($('rate').value),ft=$('feeType').value,fv=ft==='none'?0:parseNum($('feeVal').value);
-  if(!(amt>0&&rate>0)||!(fv>=0)) return null;
-  const r=calcConvert({amt,rate,feeType:ft,feeVal:fv});
-  return {amt,rate,r};
+  const amt=parseNum($('amt').value),rate=parseNum($('rate').value),ft=$('feeType').value,fv=ft==='none'?0:numOr0('feeVal');
+  try{return {amt,rate,r:calcConvert({amt,rate,feeType:ft,feeVal:fv})};}catch(e){return null;}
 }
 function saveConv(){
   const h=readHome(); if(!h) return;
@@ -870,7 +980,7 @@ function renderFavs(){
 }
 function renderRecent(){
   const box=$('recentList'), h=S.history.slice(0,5);
-  box.innerHTML=h.length?h.map(e=>`<div class="recent"><span>${e.from}→${e.to}<br><span class="hint">${dtFmt(e.ts)}</span></span><span style="text-align:end"><b>${e.pnl!==null?`<span class="${e.pnl>0?'pos':e.pnl<0?'neg':'zero'}">${e.pnl>0?'+':''}${fmt(e.pnl,CUR[e.pnlCur||e.from].dec)} ${e.pnlCur||e.from}</span>`:fmtM(e.netVal,e.netCur)}</b><br><span class="hint">${fmt(e.amount,CUR[e.from].dec)} ${e.from}</span></span></div>`).join(''):`<div class="hint">${t('noRecent')}</div>`;
+  box.innerHTML=h.length?h.map(e=>`<div class="recent"><span>${esc(e.from)}→${esc(e.to)}<br><span class="hint">${dtFmt(e.ts)}</span></span><span style="text-align:end"><b>${e.pnl!==null?`<span class="${e.pnl>0?'pos':e.pnl<0?'neg':'zero'}">${e.pnl>0?'+':''}${fmt(e.pnl,CUR[e.pnlCur||e.from].dec)} ${esc(e.pnlCur||e.from)}</span>`:fmtM(e.netVal,e.netCur)}</b><br><span class="hint">${fmt(e.amount,CUR[e.from].dec)} ${esc(e.from)}</span></span></div>`).join(''):`<div class="hint">${t('noRecent')}</div>`;
 }
 
 /* ================= الرسم البياني (بيانات فعلية فقط) ================= */
@@ -921,19 +1031,17 @@ function pnlAutoRates(force){
 let lastPnl=null;
 function calcPnlUI(){
   pnlLabels();
-  const A=S.pa,B=S.pb, cap=parseNum($('cap').value),r1=parseNum($('r1').value),r2=parseNum($('r2').value),f1=parseNum($('f1').value),f2=parseNum($('f2').value);
+  const A=S.pa,B=S.pb, cap=parseNum($('cap').value),r1=parseNum($('r1').value),r2=parseNum($('r2').value),f1=numOr0('f1'),f2=numOr0('f2');
   const v=$('verdict'); lastPnl=null;
   const fu=flagUrl(A); v.style.backgroundImage=fu?`linear-gradient(rgba(7,7,10,.72),rgba(7,7,10,.9)),url(${fu})`:'';
   const clear=(msg)=>{
     v.className='verdict tie';$('vTitle').textContent=msg||t('vWait');$('vVal').textContent='—';$('vPct').textContent='';
     ['p_cap','p_g1','p_f1','p_a1','p_g2','p_f2','p_fees','p_rec','p_be'].forEach(i=>$(i).textContent='—'); $('savePnl').disabled=true;
   };
-  let err='';
-  if(A===B) err=t('eSame'); else if(!(cap>0)) err=t('eCap'); else if(!(r1>0)||!(r2>0)) err=t('eRate'); else if(!(f1>=0)||!(f2>=0)) err=t('eFee');
-  $('pnlErr').textContent=err;
-  if(err){clear(isNaN(cap)&&isNaN(r1)?null:err);return;}
-  const r=calcPnl({cap,r1,r2,f1:f1,f2:f2});
-  if(!(r.after1>0)){$('pnlErr').textContent=t('eAfter');clear(t('eAfter'));return;}
+  let r;
+  try{ if(A===B) throw CalcError('same'); r=calcPnl({cap,r1,r2,f1,f2}); }
+  catch(e){ const m=calcErrMsg(e); $('pnlErr').textContent=m; clear((isNaN(cap)&&isNaN(r1)&&isNaN(r2))?null:m); return; }
+  $('pnlErr').textContent='';
   lastPnl={cap,r1,r2,f1,f2,r};
   const tol=tolerance(A), cls=r.pnl>tol?'gain':r.pnl<-tol?'loss':'tie';
   v.className='verdict '+cls;
@@ -973,11 +1081,11 @@ function rankOffers(){
   const amt=parseNum($('cmpAmt').value), box=$('ranking'), mkt=cross(S.cf,S.ct), dec=CUR[S.ct].dec;
   if(!S.offers.length){box.innerHTML=`<div class="hint">${t('noOffers')}</div>`;return;}
   if(!(amt>0)){box.innerHTML=`<div class="warn">${t('eAmt')}</div>`;return;}
-  const rows=S.offers.map((o,i)=>{
-    const rate=parseNum(o.rate),sf=o.sf===''?0:parseNum(o.sf),rf=o.rf===''?0:parseNum(o.rf),ex=o.ex===''?0:parseNum(o.ex);
-    const name=o.name||t(o.key||'offerCustom');
-    const valid=rate>0&&sf>=0&&rf>=0&&ex>=0&&amt-sf>0;
-    return {name,valid,net:valid?calcOffer({amt,rate,sf,rf,ex}):NaN,rate,o};
+  const rows=S.offers.map(o=>{
+    const pz=v=>String(v).trim()===''?0:parseNum(v), name=o.name||t(o.key||'offerCustom');
+    if(String(o.rate).trim()==='') return {name,valid:false,msg:t('pending'),o};
+    try{ return {name,valid:true,net:calcOffer({amt,rate:parseNum(o.rate),sf:pz(o.sf),rf:pz(o.rf),ex:pz(o.ex)}),o}; }
+    catch(e){ return {name,valid:false,msg:calcErrMsg(e),o,err:true}; }
   });
   const ok=rows.filter(r=>r.valid).sort((a,b)=>b.net-a.net), bad=rows.filter(r=>!r.valid), best=ok.length?ok[0].net:0;
   box.innerHTML=ok.map((r,i)=>{
@@ -985,7 +1093,7 @@ function rankOffers(){
     return `<div class="rank ${i===0?'best':''}"><div class="no">${i+1}</div><div class="info"><b>${esc(r.name)}</b> ${i===0?`<span class="badge live">${t('best')}</span>`:''}
       <div class="hint">${i>0?`${t('vsBest')} <span class="neg" style="direction:ltr;display:inline-block">${fmt(diff,dec)} ${S.ct}</span> · `:''}${t('effRate')}: ${fmtRate(eff)}${mkt?` · ${t('vsMkt')}: <span class="${eff>=mkt?'pos':'neg'}" style="direction:ltr;display:inline-block">${eff>=mkt?'+':''}${fmt((eff/mkt-1)*100,2)}%</span>`:''}${r.o.time?` · ⏱ ${esc(r.o.time)}`:''}</div></div>
       <div class="net">${fmt(r.net,dec)} ${S.ct}</div></div>`;}).join('')
-   +bad.map(r=>`<div class="rank pending"><div class="no">–</div><div class="info"><b>${esc(r.name)}</b><div class="hint">${t('pending')}</div></div></div>`).join('');
+   +bad.map(r=>`<div class="rank pending"><div class="no">–</div><div class="info"><b>${esc(r.name)}</b><div class="hint ${r.err?'neg':''}">${esc(r.msg)}</div></div></div>`).join('');
 }
 
 /* ================= السجل ================= */
@@ -1006,10 +1114,10 @@ function filtered(){
 function pnlCell(e){
   if(e.pnl===null||e.pnl===undefined) return '—';
   const tol=tolerance(e.pnlCur), cls=e.pnl>tol?'pos':e.pnl<-tol?'neg':'zero';
-  return `<span class="${cls}">${e.pnl>tol?'+':''}${fmt(e.pnl,CUR[e.pnlCur].dec)} ${e.pnlCur} (${e.pnlPct>0?'+':''}${fmt(e.pnlPct,2)}%)</span>`;
+  return `<span class="${cls}">${e.pnl>tol?'+':''}${fmt(e.pnl,CUR[e.pnlCur].dec)} ${esc(e.pnlCur)} (${e.pnlPct>0?'+':''}${fmt(e.pnlPct,2)}%)</span>`;
 }
 function histRow(e,del){
-  return `<tr><td>${dtFmt(e.ts)}</td><td>${e.type==='pnl'?t('tPnl'):t('tConv')}</td><td>${e.from}</td><td>${e.to}</td><td class="ltr">${fmt(e.amount,CUR[e.from].dec)}</td><td class="ltr">${fmtRate(e.rate)}</td><td class="ltr">${esc(e.feeText||'')}</td><td class="ltr">${fmtM(e.netVal,e.netCur)}</td><td class="ltr">${pnlCell(e)}</td>${del?`<td><button class="btn sm danger" data-hdel="${e.id}">✕</button></td>`:''}</tr>`;
+  return `<tr><td>${dtFmt(e.ts)}</td><td>${e.type==='pnl'?t('tPnl'):t('tConv')}</td><td>${esc(e.from)}</td><td>${esc(e.to)}</td><td class="ltr">${fmt(e.amount,CUR[e.from].dec)}</td><td class="ltr">${fmtRate(e.rate)}</td><td class="ltr">${esc(e.feeText||'')}</td><td class="ltr">${fmtM(e.netVal,e.netCur)}</td><td class="ltr">${pnlCell(e)}</td>${del?`<td><button class="btn sm danger" data-hdel="${esc(e.id)}">✕</button></td>`:''}</tr>`;
 }
 const HEADS=()=>[t('hDate'),t('hType'),t('hFrom'),t('hTo'),t('hAmt'),t('hRate'),t('hFee'),t('hNet'),t('hPnl')];
 function renderHistory(){
@@ -1108,13 +1216,13 @@ function init(){
   $('langBtn').onclick=()=>{S.lang=S.lang==='ar'?'en':'ar';save();applyLang();};
   $('refreshBtn').onclick=()=>fetchRates(false); $('bannerClose').onclick=hideBanner;
   // المحول
-  const homeChange=()=>{setCurBtn('fromBtn',S.from);setCurBtn('toBtn',S.to);syncRate();renderFavs();loadChartSoon();};
-  $('fromBtn').onclick=()=>pick('from',()=>{homeChange();});
-  $('toBtn').onclick=()=>pick('to',()=>{homeChange();});
+  const homeChange=(keepManual)=>{if(keepManual!==true)S.manual=false;setCurBtn('fromBtn',S.from);setCurBtn('toBtn',S.to);syncRate();renderFavs();loadChartSoon();};
+  $('fromBtn').onclick=()=>pick('from',()=>homeChange());
+  $('toBtn').onclick=()=>pick('to',()=>homeChange());
   $('swapBtn').onclick=()=>{
     const r=parseNum($('rate').value); [S.from,S.to]=[S.to,S.from];
     if(S.manual&&r>0) $('rate').value=rateStr(1/r);   // عكس اتجاه السعر اليدوي
-    save();homeChange();
+    save();homeChange(true);
   };
   ['amt','feeVal','spread'].forEach(i=>$(i).addEventListener('input',calcHome));
   $('feeType').addEventListener('change',calcHome);
@@ -1140,7 +1248,11 @@ function init(){
   $('pnlFill').onclick=()=>{pnlAutoRates(true);if(!cross(S.pa,S.pb))showBanner(t('cmpRefNone'),true);};
   $('savePnl').onclick=savePnl;
   // المقارنة
-  const cmpCh=()=>{save();renderOffers();renderCmp();};
+  const cmpCh=()=>{
+    const dirty=S.offers.some(o=>String(o.rate).trim()!==''||['sf','rf','ex'].some(k=>String(o[k]).trim()!==''&&parseNum(o[k])!==0));
+    if(dirty){S.offers.forEach(o=>{o.rate='';o.sf='0';o.rf='0';o.ex='0';});toast(t('offersReset'));}
+    save();renderOffers();renderCmp();
+  };
   $('cfBtn').onclick=()=>pick('cf',cmpCh); $('ctBtn').onclick=()=>pick('ct',cmpCh);
   $('cmpSwap').onclick=()=>{[S.cf,S.ct]=[S.ct,S.cf];cmpCh();};
   $('cmpAmt').addEventListener('input',rankOffers);
@@ -1181,4 +1293,3 @@ init();
 </script>
 </body>
 </html>
-
